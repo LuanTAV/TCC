@@ -6,7 +6,8 @@ import csv
 import torch
 import torchaudio
 import torch.nn as nn
- 
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report
+
 sys.path.append("../../PANN/audioset_tagging_cnn/pytorch/")
 from models import *
 
@@ -45,15 +46,17 @@ class Transfer_Cnn10(nn.Module):
         """
         output_dict = self.base(input, None)
         embedding = output_dict['embedding']
-        clipwise_output =  torch.log_softmax(self.fc_transfer(embedding), dim=-1) # talvez mudar para sigmoid para classificaçao binaria (classes_num = 2)
-        output_dict['clipwise_output'] = clipwise_output
+        logits = self.fc_transfer(embedding)  # logits crus
+        #clipwise_output =  torch.log_softmax(self.fc_transfer(embedding), dim=-1) # talvez mudar para sigmoid para classificaçao binaria (classes_num = 2)
+        #output_dict['clipwise_output'] = clipwise_output
+        output_dict['clipwise_output'] = logits # na verdade sao logits e nao probabilidades aqui
  
         return output_dict
     
 def process_batches(filtered_audios, files, audio_target_dictionary, batch_size, file_index, device):
 
     new_sample_rate = 32000
-    sample_rate = 22050 # sr apos filtragem
+    sample_rate = 32000 #22050 # sr apos filtragem
     data_batch = []
     
     audio_target_list = []
@@ -63,20 +66,13 @@ def process_batches(filtered_audios, files, audio_target_dictionary, batch_size,
 
         data_path = files[file_index]
         data_elem = filtered_audios[file_index]
-
+        #print(f"AQUI: {data_path}, {data_elem}")
         data_elem = torch.from_numpy(data_elem).float()
 
-        data_elem = torchaudio.transforms.Resample(sample_rate, new_sample_rate)(data_elem)
-        sample_rate = new_sample_rate
+        # data_elem = torchaudio.transforms.Resample(sample_rate, new_sample_rate)(data_elem)
+        # sample_rate = new_sample_rate
         
         data_batch.append(data_elem)
-        
-        #if audio_target_dictionary[data_path] == 0:
-        #    audio_target_list.append(0)
-        #elif audio_target_dictionary[data_path] == 1:
-        #    audio_target_list.append(1)
-        #else: #this should not happen
-        #    audio_target_list.append(2)
 
         audio_target_list.append(audio_target_dictionary[data_path])
         
@@ -93,15 +89,15 @@ def process_batches(filtered_audios, files, audio_target_dictionary, batch_size,
     return data_batch, audio_target_list, file_index
 
 #function to train model
-def run_epoch(model, loss_compute, filtered_audios, files, audio_target_dictionary, device, training=True, batch_size=16):
+def run_epoch(epoch, model, loss_compute, filtered_audios, files, audio_target_dictionary, device, training=True, batch_size=16):
     "Standard Training and Logging Function"
-    train_acc_avg = 0
-    f1_score_avg = 0
+    train_acc_avg = 0.0
+    f1_score_avg = 0.0
     
     number_elements = len(files)
     
-    outputs=[]
-    targets=[]
+    outputs=[] # preds por batch
+    targets=[] # y_true por batch
     
     file_index = 0
     step_index = 0
@@ -112,22 +108,34 @@ def run_epoch(model, loss_compute, filtered_audios, files, audio_target_dictiona
         
         output_dict = model.forward(data_batch)
 
-        _, train_acc, f1_score, output, target = loss_compute(output_dict, audio_target_list, training)
+        _, train_acc, f1_score_step, output, target = loss_compute(output_dict, audio_target_list, training)
         
         outputs.append(output)
         targets.append(target)
 
         train_acc_avg = (train_acc_avg*(step_index-1)+train_acc)/(step_index)
-        f1_score_avg = (f1_score_avg*(step_index-1)+f1_score)/(step_index)
+        f1_score_avg = (f1_score_avg*(step_index-1)+f1_score_step)/(step_index)
         
-        if step_index % 5 == 1:
-            print("Epoch Step: %d  Train_acc: %f F1_score: %f" %
-                    (step_index, train_acc_avg, f1_score_avg))
+        #if step_index % 5 == 1:
+        print(f"[Epoch {epoch+1}] Step {step_index}/{(len(files)+batch_size-1)//batch_size} "
+            f"| Batch size: {data_batch.size(0)} "
+            f"| Train Acc: {train_acc_avg:.4f} "
+            f"| F1: {f1_score_avg:.4f}")
 
     outputs = np.concatenate(outputs)
     targets = np.concatenate(targets)
-    true_f1_score = sklearn.metrics.f1_score(targets, outputs, labels=[0,1], average='macro')
+    true_f1_score = sklearn.metrics.f1_score(targets, outputs, average='macro', zero_division=0)
     print('Final F1_score=', true_f1_score)
+
+    if training == False:
+        # print("Matriz de confusão:\n",
+        #       confusion_matrix(targets, outputs))
+        # perm = np.random.permutation(len(targets))
+        # f1_shuffle = f1_score(targets[perm], outputs, zero_division=0)
+        # print("F1_macro com y_true embaralhado (deve cair MUITO):", f1_shuffle)
+        print("VAL: shape preds/targets:", len(outputs), len(targets))
+        print(confusion_matrix(targets, outputs))
+        print(classification_report(targets, outputs, digits=4))
     
     return train_acc_avg, f1_score_avg, true_f1_score
 
@@ -148,7 +156,7 @@ class LossCompute:
         train_acc = torch.sum(predicted==y)/y.shape[0]
         preds = predicted.detach().cpu().clone()
         y_true = y.detach().cpu().clone()
-        f1_score = sklearn.metrics.f1_score(y_true, preds, labels=[0,1], average='macro')
+        f1_score = sklearn.metrics.f1_score(y_true, preds, average='macro', zero_division=0) # average='macro'
             
         if training == True:
             loss.backward()
@@ -176,10 +184,11 @@ def write_to_csv(model, csv_filepath, filtered_audios, files, device, filtrado =
             data_elem = filtered_audios[index]
             #print("Elem: ", data_elem)
 
-            if(filtrado):
-                data_elem = torch.from_numpy(data_elem).float()
-                data_elem = torchaudio.transforms.Resample(sample_rate, new_sample_rate)(data_elem)
-                sample_rate = new_sample_rate
+            data_elem = torch.from_numpy(data_elem).float()
+
+            #if(filtrado):
+                #data_elem = torchaudio.transforms.Resample(sample_rate, new_sample_rate)(data_elem)
+                #sample_rate = new_sample_rate
 
             data_batch.append(data_elem)
 
@@ -198,3 +207,34 @@ def write_to_csv(model, csv_filepath, filtered_audios, files, device, filtrado =
             writer.writerow(data_row)
             
     return True
+
+
+class NoamOpt:
+    "Optim wrapper that implements rate."
+    def __init__(self, model_size, factor, warmup, optimizer):
+        self.optimizer = optimizer
+        self._step = 0
+        self.warmup = warmup
+        self.factor = factor
+        self.model_size = model_size
+        self._rate = 0
+        
+    def step(self):
+        "Update parameters and rate"
+        self._step += 1
+        rate = self.rate()
+        for p in self.optimizer.param_groups:
+            p['lr'] = rate
+        self._rate = rate
+        self.optimizer.step()
+        
+    def rate(self, step = None):
+        "Implement `lrate` above"
+        if step is None:
+            step = self._step
+        #return self.factor * \ (self.model_size ** (-0.5) * min(step ** (-0.5), step * self.warmup ** (-1.5)))
+        return 0.0001
+        
+def get_std_opt(model):
+    return NoamOpt(model.src_embed[0].d_model, 2, 4000,
+            torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))

@@ -14,12 +14,13 @@ import seaborn as sns
 import soundfile as sf
 import pandas
 import argparse
+import librosa
 
 sys.path.append("../PANN/audioset_tagging_cnn/pytorch/")
 from models import *
 sys.path.append("utils/")
 from dataset import *
-from filtragem import noise_reduction
+from filtragem import noise_reduction, verify_windows_labels
 from modelo import *
 
 # SEED = 42
@@ -38,13 +39,13 @@ window_size = 1024
 hop_size = 320
 mel_bins = 64
 fmin = 0
-fmax = 32000
+fmax = 16000 #32000/2
 model_type = "Transfer_Cnn10"
 freeze_base = False
 device = 'cuda' if (torch.cuda.is_available()) else 'cpu'
 classes_num = 2 # saudavel ou nao
 
-filter_test = True # filtrar ou nao os dados de teste
+
 test_files_filtered = []
 
 
@@ -54,19 +55,20 @@ model = Model(sample_rate, window_size, hop_size, mel_bins, fmin, fmax, classes_
 
 # Argumentos do filtro
 parser = argparse.ArgumentParser()
-parser.add_argument("--freq", type=int, default=8) # shape do filtro aplicado sobre o ruído 3
-parser.add_argument("--time", type=int, default=8) # shape do filtro aplicado sobre o ruído 3
-parser.add_argument("--thresh", type=float, default=3.0) # limiar em multiplos de STD para o ruído 2
+parser.add_argument("--freq", type=int, default=3) # shape do filtro aplicado sobre o ruído 3
+parser.add_argument("--time", type=int, default=3) # shape do filtro aplicado sobre o ruído 3
+parser.add_argument("--thresh", type=float, default=2.0) # limiar em multiplos de STD para o ruído 2
 parser.add_argument("--propdec", type=float, default=0.5) # intensidade da supressão do ruído 1.0
 parser.add_argument("--param", type=str, default="Melhor") # parametro atual testado
 parser.add_argument("--it", type=int, default=0) # iteracao atual
+parser.add_argument("--filter", type=int, default=1) # filtrar ou nao
 
 args = parser.parse_args()
 
+filter_test = True if args.filter==1 else False # filtrar ou nao os dados de teste
+
 acc_mean = 0
 f1_mean = 0
-
-#for i in range(args.qtd):
 
 model_path = f'testes/checkpoints/model_filtro{args.param}{args.it}.ckpt'
 
@@ -81,21 +83,34 @@ if 'cuda' in device:
 
 model.eval()
 
-
 audio_target_dictionary = {}
 
 test_files = Load_Test_dataset(audio_target_dictionary)
 
 # Testes com ou sem filtro
 if(filter_test):
-    test_files_filtered = noise_reduction(test_files, args.freq, args.time, args.thresh, args.propdec)
+    test_files_filtered, test_files = noise_reduction(test_files, args.freq, args.time, args.thresh, args.propdec)
+    #verify_windows_labels(test_files_filtered, test_files, audio_target_dictionary, sr=32000)
 else:
     test_files_filtered = Load_Normal_audios(test_files)
 
+print(f"Quantidade de audios: {len(test_files_filtered)}/{len(test_files)}")
 csv_filepath = 'test.csv'
 
 with torch.no_grad():
     print(write_to_csv(model, csv_filepath, test_files_filtered, test_files, device, filter_test))
+    for i, (filename, data_elem) in enumerate(zip(test_files, test_files_filtered)):
+        if i > 10:  # mostra só 10 exemplos
+            data_batch = torch.from_numpy(data_elem).unsqueeze(0).to(device).float()
+
+            output_dict = model(data_batch)
+            logits = output_dict['clipwise_output']
+            probs = torch.softmax(logits, dim=1)
+
+            #print(f"\nArquivo: {filename}")
+            #print(f"Logits: {logits.cpu().numpy()}")
+            #print(f"Probabilidades: {probs.cpu().numpy()}")
+            #print(f"Predição: {torch.argmax(probs, dim=1).item()}")
 
 prediction_labels = pandas.read_csv(csv_filepath)
 test_folder = '../../SPIRA/SPIRA_Dataset_V2/'
@@ -128,9 +143,13 @@ print(cm)
 
 acc = accuracy_score(true_labels_list, prediction_labels_list)
 f1 = f1_score(true_labels_list, prediction_labels_list)
+precision = precision_score(true_labels_list, prediction_labels_list)
+recall = recall_score(true_labels_list, prediction_labels_list)
 
-acc_mean = acc_mean + acc
-f1_mean = f1_mean + f1
+print(acc)
+
+#acc_mean = acc_mean + acc
+#f1_mean = f1_mean + f1
 
 # plt.figure(figsize=(6, 6))
 # sns.heatmap(cm, annot=True, fmt='d', cmap='Reds', cbar=False)
@@ -145,9 +164,9 @@ f1_mean = f1_mean + f1
 if(args.param == "optuna"):
     print(f"Acurácia: {acc:.4f}")
     print(f"F1-score: {f1:.4f}")
-# else:
-#     with open(f"testes/results_full_media_{args.param}.csv", "a") as f:
-#         f.write(f"{args.param},{args.it},{args.thresh},{args.propdec},{args.freq},{args.time},{acc:.4f},{f1:.4f}\n")
+else:
+   with open(f"resultados/resultado_sensibilidade_{args.param}.csv", "a") as f:
+       f.write(f"{args.param},{args.it},{args.thresh},{args.propdec},{args.freq},{args.time},{acc:.4f},{f1:.4f},{precision:.4f},{recall:.4f}\n")
 
 
 # acc_mean = acc_mean / args.qtd
