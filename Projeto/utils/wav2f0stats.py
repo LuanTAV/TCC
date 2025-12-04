@@ -24,7 +24,7 @@ def wav2f0stats(file_path, threshold = 6):
     NOISE_THRESHOLD = float(threshold)
 
     def opusfile_read(filename):
-        x, rate = librosa.load(filename, sr=32000, mono=True)
+        x, rate = librosa.load(filename, sr=16000, mono=True)
         return rate, x
     
     # abre sinal gravado em arquivo

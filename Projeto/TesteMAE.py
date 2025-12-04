@@ -21,27 +21,18 @@ sys.path.append("../PANN/audioset_tagging_cnn/pytorch/")
 from models import *
 sys.path.append("utils/")
 from dataset import *
-from filtragem import noise_reduction
+from filtragem import noise_reduction#, verify_windows_labels
 from modelo import *
-
-# SEED = 42
-
-# random.seed(SEED)
-# np.random.seed(SEED)
-# torch.manual_seed(SEED)
-# torch.cuda.manual_seed(SEED)
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
 
 
 # Arguments & parameters
-sample_rate = 32000
+sample_rate = 16000
 window_size = 1024
-hop_size = 320
-mel_bins = 64
+hop_size = 160
+mel_bins = 128
 fmin = 0
-fmax = 16000 #32000/2
-model_type = "Transfer_Cnn10"
+fmax = 8000 #16000/2
+model_type = "Transfer_AudioMAE"
 freeze_base = False
 device = 'cuda' if (torch.cuda.is_available()) else 'cpu'
 classes_num = 2 # saudavel ou nao
@@ -50,20 +41,17 @@ classes_num = 2 # saudavel ou nao
 test_files_filtered = []
 
 
-
-Model = eval(model_type)
-model = Model(sample_rate, window_size, hop_size, mel_bins, fmin, fmax, classes_num, freeze_base)
-
 # Argumentos do filtro
 parser = argparse.ArgumentParser()
 parser.add_argument("--freq", type=int, default=3) # shape do filtro aplicado sobre o ruído 3
 parser.add_argument("--time", type=int, default=3) # shape do filtro aplicado sobre o ruído 3
 parser.add_argument("--thresh", type=float, default=2.0) # limiar em multiplos de STD para o ruído 2
-parser.add_argument("--propdec", type=float, default=0.5) # intensidade da supressão do ruído 1.0
+parser.add_argument("--propdec", type=float, default=1.0) # intensidade da supressão do ruído 1.0
 parser.add_argument("--param", type=str, default="Melhor") # parametro atual testado
 parser.add_argument("--it", type=int, default=0) # iteracao atual
 parser.add_argument("--filter", type=int, default=1) # filtrar ou nao
 parser.add_argument("--noise", type=int, default=0)
+parser.add_argument("--masking", type=float, default=0.0)
 parser.add_argument("--threshold", type=float, default=0.34)
 parser.add_argument("--threshold_db", type=float,default=0)
 
@@ -76,7 +64,12 @@ acc_mean = 0
 f1_mean = 0
 
 model_path = f'testes/checkpoints/model_filtro{args.param}{args.it}.ckpt'
-model_path =  f'resultados/Monografia/Experimento2/model_filtro{args.param}{args.it}.ckpt'
+
+Model = eval(model_type)
+model = Model(classes_num=classes_num,
+              freeze_base=freeze_base,
+              pretrained_checkpoint=model_path,
+              training = False)
 
 # Load trained model
 logging.info('Load pretrained model from {}'.format(model_path))
@@ -91,7 +84,7 @@ model.eval()
 
 audio_target_dictionary = {}
 
-test_files = Load_Test_dataset(audio_target_dictionary,noise_test)
+test_files = Load_Test_dataset(audio_target_dictionary, noise_test)
 
 # Testes com ou sem filtro
 if(filter_test):
@@ -103,7 +96,7 @@ print(f"Quantidade de audios: {len(test_files_filtered)}/{len(test_files)}")
 csv_filepath = 'test.csv'
 
 with torch.no_grad():
-    print(write_to_csv(model, csv_filepath, test_files_filtered, test_files, device, transformer=False))
+    print(write_to_csv(model, csv_filepath, test_files_filtered, test_files, device, transformer = True, masking=args.masking))
 
 
 prediction_labels = pandas.read_csv(csv_filepath)
@@ -149,38 +142,12 @@ recall = recall_score(true_labels_list, prediction_labels_list)
 
 print(acc)
 
-#acc_mean = acc_mean + acc
-#f1_mean = f1_mean + f1
 
-# plt.figure(figsize=(6, 6))
-# sns.heatmap(cm, annot=True, fmt='d', cmap='Reds', cbar=False)
-# plt.title(f'Matriz de Confusão\nAcurácia: {acc:.4f} | F1-score: {f1:.4f}')
-# plt.xlabel('Previsto')
-# plt.ylabel('Real')
+out_path = f"resultados/resultado_{args.param}.csv"
+file_exists = os.path.exists(out_path)
 
-# plt.tight_layout()
-# plt.savefig(f'testes/results{args.param}{args.it}.png', dpi=300)
-# plt.close()
-
-if(args.param == "optuna"):
-    print(f"Acurácia: {acc:.4f}")
-    print(f"F1-score: {f1:.4f}")
-else:
-    out_path = f"resultados/resultado_sensibilidade_{args.param}.csv"
-    file_exists = os.path.exists(out_path)
-
-    with open(out_path, "a") as f:
-        if not file_exists:
-            f.write("param,it,thresh,propdec,freq,time,acc,f1,precision,recall,specificity\n")
-        f.write(f"{args.param},{args.it},{args.thresh},{args.propdec},{args.freq},{args.time},"
-                f"{acc:.4f},{f1:.4f},{precision:.4f},{recall:.4f},{specificity:.4f}\n")
-#else:
-#   with open(f"resultados/resultado_sensibilidade_{args.param}.csv", "a") as f:
-#       f.write(f"{args.param},{args.it},{args.thresh},{args.propdec},{args.freq},{args.time},{acc:.4f},{f1:.4f},{precision:.4f},{recall:.4f},{specificity:.4f}\n")
-
-
-# acc_mean = acc_mean / args.qtd
-# f1_mean = f1_mean / args.qtd
-
-# with open(f"testes/results_resumo_media_{args.param}.csv", "a") as f:
-#     f.write(f"{args.param},{args.it},{args.thresh},{args.propdec},{args.freq},{args.time},{acc_mean:.4f},{f1_mean:.4f}\n")
+with open(out_path, "a") as f:
+    if not file_exists:
+        f.write("param,it,thresh,propdec,freq,time,masking,threshold,acc,f1,precision,recall,specificity\n")
+    f.write(f"{args.param},{args.it},{args.thresh},{args.propdec},{args.freq},{args.time},{args.masking},{args.threshold},"
+            f"{acc:.4f},{f1:.4f},{precision:.4f},{recall:.4f},{specificity:.4f}\n")

@@ -2,22 +2,13 @@
 import sys
 import numpy as np
 import random
-#import time
 import logging
 import matplotlib.pyplot as plt
-# import sklearn
-# import csv
 import pandas as pd
 from sklearn.metrics import classification_report, accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 import torch
-# import torchaudio
-# import torch.nn as nn
-# import torch.nn.functional as F
-# import torch.optim as optim
-# import torch.utils.data
-# import seaborn as sns
-# import soundfile as sf
 import argparse
+import torchaudio
  
 sys.path.append("../PANN/audioset_tagging_cnn/pytorch/")
 from models import *
@@ -30,48 +21,54 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)  # all não só manual_seed
+torch.cuda.manual_seed_all(SEED) 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-#torch.use_deterministic_algorithms(True)  # lança erro se alguma op for não-determinística
 
 # Arguments & parameters
-sample_rate = 32000
+sample_rate = 16000
 window_size = 1024
 hop_size = 320
-mel_bins = 64
+mel_bins = 128 #64
 fmin = 0
-fmax = 16000 #32000/2
-model_type = "Transfer_Cnn10"
-pretrained_checkpoint_path = "Cnn10_mAP=0.380.pth"
+fmax = 8000 #16000/2
+model_type = "Transfer_AudioMAE"
+pretrained_checkpoint_path = "../AudioMAE/checkpoints/pretrained.pth"
 freeze_base = False
 device = 'cuda' if (torch.cuda.is_available()) else 'cpu'
 classes_num = 2 # saudavel ou nao
 pretrain = True if pretrained_checkpoint_path else False
 
+mel_spectrogrammer = torchaudio.transforms.MelSpectrogram(
+    sample_rate=sample_rate,
+    n_fft=window_size,
+    hop_length=hop_size,
+    n_mels=mel_bins,
+    f_min=fmin,
+    f_max=fmax,
+)
+
 # Model
 Model = eval(model_type)
-model = Model(sample_rate, window_size, hop_size, mel_bins, fmin, fmax, classes_num, freeze_base)
-
-# Load pretrained model
-if pretrain:
-    logging.info('Load pretrained model from {}'.format(pretrained_checkpoint_path))
-    model.load_from_pretrain(pretrained_checkpoint_path)
-    print('Load pretrained model successfully!')
+model = Model(classes_num=classes_num,
+              freeze_base=freeze_base,
+              pretrained_checkpoint=pretrained_checkpoint_path)
 
 if 'cuda' in device:
     model.to(device)
     print("Utilizando: ",device)
 
-# Otmizador
-#model_opt = torch.optim.Adam(model.parameters(), lr=1e-5, betas=(0.9, 0.98), eps=1e-9)
-head_params = list(model.fc_transfer.parameters())
-base_params = [p for n, p in model.named_parameters() if not n.startswith('fc_transfer')]
 
-model_opt = torch.optim.Adam([
-    {'params': base_params, 'lr': 1e-5},   # base pré-treinada 
-    {'params': head_params, 'lr': 1e-4},   # nova camada
-], betas=(0.9, 0.98), eps=1e-9)
+# Otmizador
+head_params = list(model.head.parameters())
+base_params = list(model.base.parameters()) 
+
+# Configuração do otimizador com grupos de parâmetros
+model_opt = torch.optim.AdamW([
+    { 'params': head_params, 'lr': 1e-3, 'weight_decay': 0.0 }, # LR maior para a cabeça, sem weight decay
+    { 'params': base_params, 'lr': 5e-5, 'weight_decay': 0.05 }  # LR bem menor para a base
+], betas=(0.9, 0.95), eps=1e-8)
+
 
 # Variaveis e estatísticas
 best_val_acc = 0
@@ -88,30 +85,33 @@ val_f1s = []
 # Argumentos do filtro
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--freq", type=int, default=4) # shape do filtro aplicado sobre o ruído
-parser.add_argument("--time", type=int, default=8) # shape do filtro aplicado sobre o ruído
-parser.add_argument("--thresh", type=float, default=1.5) # limiar em multiplos de STD para o ruído
+parser.add_argument("--freq", type=int, default=3) # shape do filtro aplicado sobre o ruído
+parser.add_argument("--time", type=int, default=3) # shape do filtro aplicado sobre o ruído
+parser.add_argument("--thresh", type=float, default=2) # limiar em multiplos de STD para o ruído
 parser.add_argument("--propdec", type=float, default=1.0) # intensidade da supressão do ruído
-parser.add_argument("--param", type=str, default="None") # parametro atual testado
-parser.add_argument("--it", type=int, default=0) # iteracao atual (usado para separar os checkpoints)
+parser.add_argument("--param", type=str, default="Filtragem") # parametro atual testado
+parser.add_argument("--it", type=int, default=0) # iteracao atual  
 parser.add_argument("--filter", type=int, default=1) # filtrar ou nao
-parser.add_argument("--threshold", type=float, default=0.34) # calculo de threshold por porcentagem
-parser.add_argument("--threshold_db", type=float,default=0) # calculo de threshold por valor em db
+parser.add_argument("--noise", type=int, default=0) # ruido ou nao
+parser.add_argument("--masking", type=float, default=0.0) # porcentagem de mascara para o treino
+parser.add_argument("--threshold", type=float, default=0.34)
+parser.add_argument("--threshold_db", type=float,default=0)
 
 args = parser.parse_args()
 filter_train = True if args.filter==1 else False # filtrar ou nao os dados de treino
-reduction_method = "Db" if args.threshold_db>0 else "Pct" # modo de reducao
+noise_train = True if args.noise==1 else False
+reduction_method = "Db" if args.threshold_db>0 else "Pct"
 
 model_path = f'testes/checkpoints/model_filtro{args.param}{args.it}.ckpt'
 
 # Arquivos de audios
 audio_target_dictionary = {} # Guarda a relação path-label
-train_files = Load_Train_dataset(audio_target_dictionary)
-eval_files = Load_Eval_dataset(audio_target_dictionary)
-
+train_files = Load_Train_dataset(audio_target_dictionary, noise_train)
+eval_files = Load_Eval_dataset(audio_target_dictionary, noise_train)
+print("Arquivos de treino/eval carregados com sucesso")
 
 if(filter_train): # treino para audios com filtro
-    train_files_filtered, new_train_files = noise_reduction(train_files, model_type, args.freq, args.time, args.thresh, args.propdec, args.threshold, args.threshold_db, windows=True, training=True)
+    train_files_filtered, new_train_files = noise_reduction(train_files, model_type, args.freq, args.time, args.thresh, args.propdec, args.threshold, args.threshold_db, windows=True , training=True)
     eval_files_filtered, eval_files = noise_reduction(eval_files, model_type, args.freq, args.time, args.thresh, args.propdec, args.threshold, args.threshold_db, windows=True, training=False)
 
 else: # treino para audios sem filtro
@@ -119,11 +119,13 @@ else: # treino para audios sem filtro
     eval_files_filtered = Load_Normal_audios(eval_files)
     new_train_files = train_files
 
+#norm_mean, norm_std = calculate_norm_stats(train_files_filtered)
+
 for epoch in range(50):
     model.train()
-    train_acc, train_f1, true_train_f1 = run_epoch(epoch,model, model_type, 
+    train_acc, train_f1, true_train_f1 = run_epoch(epoch,model,model_type, 
                   LossCompute(model, model_opt),
-                  train_files_filtered, new_train_files, audio_target_dictionary, device, training=True)
+                  train_files_filtered, new_train_files, audio_target_dictionary, device, training=True, masking=args.masking)
     
     train_accs.append(train_acc)
     train_f1s.append(true_train_f1)
@@ -132,7 +134,7 @@ for epoch in range(50):
     with torch.no_grad():
         val_acc, val_f1_score, true_val_f1_score = run_epoch(epoch, model, model_type, 
                     LossCompute(model, None),
-                    eval_files_filtered, eval_files, audio_target_dictionary, device, training=False)
+                    eval_files_filtered, eval_files, audio_target_dictionary, device, training=False, masking=args.masking)
         
         val_accs.append(val_acc)
         val_f1s.append(true_val_f1_score)
@@ -158,21 +160,12 @@ for epoch in range(50):
                 'n_grad_time':   args.time,
                 'n_std_thresh':   args.thresh,
                 'prop_decrease':   args.propdec,
+                'reduction_method': reduction_method,
+                'reduction_value': args.threshold_db if args.threshold_db>0 else args.threshold
             }
         }, model_path)
 
     #train_files_filtered, new_train_files = noise_reduction(train_files, args.freq, args.time, args.thresh, args.propdec, windows=True, training=True)
-    # model.eval()
-    # with torch.no_grad():
-    #     tr_acc_eval, tr_f1_eval, _ = run_epoch(
-    #         epoch, model, model_type, LossCompute(model, None),
-    #         train_files_filtered, train_files, audio_target_dictionary,
-    #         device, training=False
-    #     )
-    #     train_accs.append(tr_acc_eval)
-    #     train_f1s.append(tr_f1_eval)
-    # print(f"[Diag] TRAIN com eval(): acc={tr_acc_eval:.3f}  F1={tr_f1_eval:.3f}")
-        #torch.save({'model_state_dict': model.state_dict()}, model_path)
 
 
 epochs = list(range(1, len(train_accs) + 1))
